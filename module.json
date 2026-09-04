@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "product": "CyberHub",
+  "type": "module",
+  "id": "gallery_auto_tagger",
+  "name": "Auto Tagger",
+  "summary": "Add searchable visual AI tags to Gallery images with WD-EVA02.",
+  "version": "1.0.5",
+  "minimum_hub_version": "1.3.0",
+  "repository": "cyberdeliaAI/CyberHub-Auto-Tagger",
+  "publisher_type": "official",
+  "channel": "stable",
+  "dependencies": [
+    "gallery"
+  ],
+  "python_dependencies": [
+    "Pillow>=9.0",
+    "numpy>=1.24"
+  ]
+}
