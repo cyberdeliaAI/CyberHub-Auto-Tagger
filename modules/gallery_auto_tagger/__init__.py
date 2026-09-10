@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.request
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core import Module
@@ -50,7 +51,7 @@ def _format_bytes(value):
 
 class AutoTaggerModule(Module):
     name = "Auto Tagger"
-    version = "1.0.5"
+    version = "1.0.6"
     icon = "\U0001F3F7"
     description = "Analyze Gallery images locally and make visual AI tags searchable."
     order = 34
@@ -259,13 +260,12 @@ class AutoTaggerModule(Module):
                     DELETE FROM auto_tagger_files WHERE file_path=OLD.path;
                 END;
             """)
-            catalog_count = conn.execute(
-                "SELECT COUNT(*) FROM auto_tagger_catalog"
-            ).fetchone()[0]
-            score_count = conn.execute(
-                "SELECT COUNT(*) FROM auto_tagger_scores"
-            ).fetchone()[0]
-            if score_count and not catalog_count:
+            catalog_exists = conn.execute(
+                "SELECT 1 FROM auto_tagger_catalog LIMIT 1"
+            ).fetchone()
+            if not catalog_exists and conn.execute(
+                "SELECT 1 FROM auto_tagger_scores LIMIT 1"
+            ).fetchone():
                 conn.execute("""
                     INSERT INTO auto_tagger_catalog(
                         tag_name,category,use_count,score_sum
@@ -681,7 +681,7 @@ class AutoTaggerModule(Module):
                     )
                 except TypeError:
                     work.thumbnail((target_size, target_size), resampling)
-            return work.convert("RGBA").copy()
+            return work.convert("RGBA")
         finally:
             if work is not image:
                 try:
@@ -739,31 +739,45 @@ class AutoTaggerModule(Module):
                 image = self._downsample_source(probe, target_size)
         return image, False
 
-    def _process_rows(self, rows):
-        if not rows:
+    def _load_rows(self, rows, target_size):
+        """Read one bounded batch; database writes stay on the job thread."""
+        loaded = []
+        for file_path, mtime in rows:
+            if self._job_cancel.is_set():
+                break
+            try:
+                image, used_thumbnail = self._load_image(file_path, target_size)
+                loaded.append((file_path, mtime, image, used_thumbnail, None))
+            except Exception as exc:
+                loaded.append((file_path, mtime, None, False, exc))
+        return loaded
+
+    @staticmethod
+    def _close_loaded_rows(loaded):
+        for _path, _mtime, image, _thumbnail, _error in loaded:
+            if image is not None:
+                image.close()
+
+    def _process_rows(self, loaded):
+        if not loaded:
             return True
-        batch_started = time.monotonic()
         with self._state_lock:
             job_id = self._job["id"]
-            start_done = int(self._job.get("done", 0))
         tagger = self._get_tagger()
         thresholds = self._thresholds()
         images = []
         good_rows = []
         try:
-            for file_path, mtime in rows:
+            for file_path, mtime, image, used_thumbnail, error in loaded:
                 if self._job_cancel.is_set():
                     break
                 with self._state_lock:
                     self._job["current"] = file_path
-                try:
-                    image, used_thumbnail = self._load_image(
-                        file_path, tagger.target_size
-                    )
+                if error is None:
                     images.append(image)
                     good_rows.append((file_path, mtime, used_thumbnail))
-                except Exception as exc:
-                    self._mark_failure(file_path, mtime, job_id, exc)
+                else:
+                    self._mark_failure(file_path, mtime, job_id, error)
                     self._advance_job(failed=True)
             if not images:
                 return True
@@ -787,6 +801,8 @@ class AutoTaggerModule(Module):
                     # The worker then switches subsequent work to batches of one.
                     batch_supported = len(images) <= 1
                     for image, row in zip(images, good_rows):
+                        if self._job_cancel.is_set():
+                            break
                         file_path, mtime, used_thumbnail = row
                         try:
                             result = tagger.tag_image(
@@ -804,12 +820,78 @@ class AutoTaggerModule(Module):
                 self._advance_job(used_thumbnail=used_thumbnail)
             return batch_supported
         finally:
-            for image in images:
-                try:
-                    image.close()
-                except Exception:
-                    pass
-            self._record_batch_rate(start_done, batch_started)
+            self._close_loaded_rows(loaded)
+
+    def _job_batches(self):
+        """Yield work in cursor order, honoring a reduced inference batch size."""
+        if self._job["scope"] == "paths":
+            conn = self._db()
+            paths = list(self._job_paths)
+            # Bound SQL parameters and avoid a separate query for every image.
+            for offset in range(0, len(paths), 128):
+                page = paths[offset:offset + 128]
+                placeholders = ",".join("?" for _ in page)
+                with self.gallery.db.lock:
+                    mtimes = dict(conn.execute(
+                        f"SELECT path,mtime FROM files WHERE path IN ({placeholders})", page
+                    ).fetchall())
+                rows = [(path, float(mtimes[path] or 0)) for path in page if path in mtimes]
+                start = 0
+                while start < len(rows):
+                    chunk = rows[start:start + self._job["batch_size"]]
+                    start += len(chunk)
+                    yield chunk
+        else:
+            while not self._job_cancel.is_set():
+                rows = self._next_scope_rows(self._job["batch_size"])
+                if not rows:
+                    break
+                yield rows
+
+    def _wait_for_job(self):
+        while self._job_pause.is_set() and not self._job_cancel.is_set():
+            self._job_cancel.wait(0.25)
+        return not self._job_cancel.is_set()
+
+    def _process_job_batches(self, tagger):
+        batches = self._job_batches()
+        pending = None
+        loaded = []
+        # One loader overlaps disk/network reads with inference. At most the
+        # current and next batch contain decoded, downsampled images.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-tagger-load") as loader:
+            try:
+                if not self._wait_for_job():
+                    return
+                rows = next(batches, [])
+                if rows:
+                    pending = loader.submit(self._load_rows, rows, tagger.target_size)
+                while pending is not None and self._wait_for_job():
+                    batch_started = time.monotonic()
+                    with self._state_lock:
+                        start_done = self._job["done"]
+                    loaded = pending.result()
+                    pending = None
+                    if not self._wait_for_job():
+                        break
+                    rows = next(batches, [])
+                    if rows:
+                        pending = loader.submit(self._load_rows, rows, tagger.target_size)
+                    start = 0
+                    while start < len(loaded) and self._wait_for_job():
+                        chunk = loaded[start:start + self._job["batch_size"]]
+                        batch_supported = self._process_rows(chunk)
+                        start += len(chunk)
+                        if not batch_supported:
+                            with self._state_lock:
+                                self._job["batch_size"] = 1
+                    self._record_batch_rate(start_done, batch_started)
+                    self._close_loaded_rows(loaded)
+                    loaded = []
+            finally:
+                self._close_loaded_rows(loaded)
+                if pending is not None and not pending.cancel():
+                    self._close_loaded_rows(pending.result())
 
     def _advance_job(self, failed=False, used_thumbnail=False):
         with self._state_lock:
@@ -932,40 +1014,7 @@ class AutoTaggerModule(Module):
             with self._state_lock:
                 self._job["device"] = tagger.device
                 self._job["batch_size"] = batch_size
-            if scope == "paths":
-                paths = list(self._job_paths)
-                conn = self._db()
-                rows = []
-                with self.gallery.db.lock:
-                    for path in paths:
-                        row = conn.execute("SELECT mtime FROM files WHERE path=?", (path,)).fetchone()
-                        if row:
-                            rows.append((path, float(row[0] or 0)))
-                start = 0
-                while start < len(rows):
-                    if self._job_cancel.is_set():
-                        break
-                    while self._job_pause.is_set() and not self._job_cancel.is_set():
-                        time.sleep(0.25)
-                    chunk = rows[start:start + batch_size]
-                    batch_supported = self._process_rows(chunk)
-                    start += len(chunk)
-                    if not batch_supported and batch_size > 1:
-                        batch_size = 1
-                        with self._state_lock:
-                            self._job["batch_size"] = 1
-            else:
-                while not self._job_cancel.is_set():
-                    while self._job_pause.is_set() and not self._job_cancel.is_set():
-                        time.sleep(0.25)
-                    rows = self._next_scope_rows(batch_size)
-                    if not rows:
-                        break
-                    batch_supported = self._process_rows(rows)
-                    if not batch_supported and batch_size > 1:
-                        batch_size = 1
-                        with self._state_lock:
-                            self._job["batch_size"] = 1
+            self._process_job_batches(tagger)
             cancelled = self._job_cancel.is_set()
             with self._state_lock:
                 completed_new_rowid = (

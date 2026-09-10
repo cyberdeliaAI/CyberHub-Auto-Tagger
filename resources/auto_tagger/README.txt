@@ -21,7 +21,11 @@ Selecting CUDA in Settings chooses the provider but does not install NVIDIA's
 ONNX Runtime package. Stop CyberHub, then run from the CyberHub folder:
 
   .venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu
-  .venv\Scripts\python.exe -m pip install --upgrade "onnxruntime-gpu[cuda,cudnn]"
+  .venv\Scripts\python.exe -m pip install --upgrade "onnxruntime-gpu[cuda,cudnn]>=1.21,<1.27"
+
+This selects the CUDA 12 / cuDNN 9 runtime family. ONNX Runtime GPU 1.27 and
+newer use CUDA 13 by default and require a matching NVIDIA driver. The pip
+packages do not install or update the NVIDIA display driver.
 
 Restart CyberHub. The Runtime card should show CUDA. Azure is not used by this
 module as a local execution provider.

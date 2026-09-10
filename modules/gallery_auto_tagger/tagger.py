@@ -55,12 +55,11 @@ def mcut_threshold(values, floor: float = 0.0) -> float:
     """Return the Maximum Cut threshold used by the official WD demo."""
     if values is None or len(values) < 2:
         return float(floor)
-    ordered = sorted((float(value) for value in values), reverse=True)
-    best_index = max(
-        range(len(ordered) - 1),
-        key=lambda index: ordered[index] - ordered[index + 1],
-    )
-    return max(float(floor), (ordered[best_index] + ordered[best_index + 1]) / 2.0)
+    import numpy as np
+
+    ordered = np.sort(np.asarray(values, dtype=np.float64))[::-1]
+    best_index = int(np.argmax(ordered[:-1] - ordered[1:]))
+    return max(float(floor), float((ordered[best_index] + ordered[best_index + 1]) / 2.0))
 
 
 def available_providers():
@@ -284,6 +283,8 @@ class WDTagger:
         return self.device
 
     def _load_vocabulary(self):
+        import numpy as np
+
         names = []
         categories = []
         with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -305,7 +306,7 @@ class WDTagger:
         self._names = names
         self._categories = categories
         self._category_indexes = {
-            category: [index for index, value in enumerate(categories) if value == category]
+            category: np.flatnonzero(np.asarray(categories) == category)
             for category in (CATEGORY_GENERAL, CATEGORY_CHARACTER, CATEGORY_RATING)
         }
 
@@ -313,10 +314,15 @@ class WDTagger:
         import numpy as np
         from PIL import Image
 
-        rgba = image.convert("RGBA")
-        rgb = Image.new("RGB", rgba.size, (255, 255, 255))
-        rgb.paste(rgba, mask=rgba.getchannel("A"))
-        rgba.close()
+        if image.mode == "RGB":
+            rgb = image
+        else:
+            rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+            rgb = Image.new("RGB", rgba.size, (255, 255, 255))
+            with rgba.getchannel("A") as alpha:
+                rgb.paste(rgba, mask=alpha)
+            if rgba is not image:
+                rgba.close()
         max_dim = max(rgb.size)
         if max_dim != self._target_size:
             resampling = getattr(Image, "Resampling", Image).BICUBIC
@@ -328,7 +334,8 @@ class WDTagger:
                 ),
                 resampling,
             )
-            rgb.close()
+            if rgb is not image:
+                rgb.close()
             rgb = resized
         left = (self._target_size - rgb.size[0]) // 2
         top = (self._target_size - rgb.size[1]) // 2
@@ -336,7 +343,8 @@ class WDTagger:
             "RGB", (self._target_size, self._target_size), (255, 255, 255)
         )
         padded.paste(rgb, (left, top))
-        rgb.close()
+        if rgb is not image:
+            rgb.close()
         array = np.asarray(padded, dtype=np.float32)[:, :, ::-1]
         padded.close()
         if self._input_layout == "NCHW":
@@ -364,6 +372,10 @@ class WDTagger:
         self.device = active[0] if active else "Unknown"
         if predictions.ndim == 1:
             predictions = predictions[None, :]
+        if predictions.ndim != 2 or predictions.shape[0] != len(prepared):
+            raise RuntimeError(
+                f"Model returned shape {predictions.shape} for {len(prepared)} images"
+            )
         if predictions.shape[-1] != len(self._names):
             raise RuntimeError(
                 f"Model returned {predictions.shape[-1]} scores for {len(self._names)} tags"
@@ -388,27 +400,33 @@ class WDTagger:
         character_threshold=0.85,
         adaptive_threshold=False,
     ):
-        general_indexes = self._category_indexes.get(CATEGORY_GENERAL, [])
-        character_indexes = self._category_indexes.get(CATEGORY_CHARACTER, [])
-        rating_indexes = self._category_indexes.get(CATEGORY_RATING, [])
+        import numpy as np
+
+        # Compare as Python floats did, including thresholds close to float32 scores.
+        scores = np.asarray(scores, dtype=np.float64)
+        general_indexes = np.asarray(self._category_indexes.get(CATEGORY_GENERAL, []), dtype=np.intp)
+        character_indexes = np.asarray(self._category_indexes.get(CATEGORY_CHARACTER, []), dtype=np.intp)
+        rating_indexes = np.asarray(self._category_indexes.get(CATEGORY_RATING, []), dtype=np.intp)
+        general_scores = scores[general_indexes]
+        character_scores = scores[character_indexes]
 
         if adaptive_threshold:
-            general_threshold = mcut_threshold([scores[index] for index in general_indexes])
+            general_threshold = mcut_threshold(general_scores)
             character_threshold = mcut_threshold(
-                [scores[index] for index in character_indexes], floor=0.15
+                character_scores, floor=0.15
             )
 
         general = [
             Tag(self._names[index], "general", float(scores[index]))
-            for index in general_indexes if float(scores[index]) > general_threshold
+            for index in general_indexes[general_scores > general_threshold]
         ]
         character = [
             Tag(self._names[index], "character", float(scores[index]))
-            for index in character_indexes if float(scores[index]) > character_threshold
+            for index in character_indexes[character_scores > character_threshold]
         ]
         rating = []
-        if rating_indexes:
-            best = max(rating_indexes, key=lambda index: float(scores[index]))
+        if len(rating_indexes):
+            best = rating_indexes[int(np.argmax(scores[rating_indexes]))]
             rating = [Tag(self._names[best], "rating", float(scores[best]))]
         general.sort(key=lambda tag: tag.score, reverse=True)
         character.sort(key=lambda tag: tag.score, reverse=True)
